@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>로봇 거치폰 실시간 AI 자율 관제 웹앱</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.20.0/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #2c3e50; color: white; margin: 0; padding: 20px; }
+        .video-container { position: relative; display: inline-block; width: 90%; max-width: 400px; }
+        #videoElement { width: 100%; background: #34495e; border-radius: 10px; }
+        #aiCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        #canvas { display: none; }
+        #loading-status { font-size: 18px; color: #f1c40f; margin-bottom: 10px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>📱 로봇 거치 폰 실시간 AI 자율 인식</h2>
+    <div id="loading-status">🤖 AI 모델 로딩 중... 잠시만 기다려주세요.</div>
+    
+    <div class="video-container">
+        <video id="videoElement" autoplay playsinline muted></video>
+        <canvas id="aiCanvas"></canvas>
+    </div>
+    <canvas id="canvas" width="320" height="240"></canvas>
+
+    <script>
+        let ros = null;
+        let detTopic = null;
+        let camTopic = null;
+        let model = null; 
+        let isAlertSent = false; 
+
+        // 1. ROSBridge 연결 (터틀봇 IP)
+        try {
+            ros = new ROSLIB.Ros({ url: 'ws://192.168.0.12:9090' });
+            ros.on('connection', () => {
+                console.log('Rosbridge 연결 성공!');
+                startCameraStreaming();
+            });
+            detTopic = new ROSLIB.Topic({ ros: ros, name: '/detection_msg', messageType: 'std_msgs/String' });
+            camTopic = new ROSLIB.Topic({ ros: ros, name: '/camera_stream', messageType: 'std_msgs/String' });
+        } catch (e) { console.error(e); }
+
+        const video = document.querySelector("#videoElement");
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+        const aiCanvas = document.getElementById("aiCanvas");
+        const aiCtx = aiCanvas.getContext("2d");
+
+        if (navigator.mediaDevices.getUserMedia) {
+            // 원본 화질 스캔을 위해 해상도 최적화
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: 640, height: 480 } })
+                .then(function (stream) { 
+                    video.srcObject = stream;
+                    video.onloadedmetadata = () => {
+                        aiCanvas.width = video.videoWidth;
+                        aiCanvas.height = video.videoHeight;
+                        loadAIModel(); 
+                    };
+                })
+                .catch(function (error) { console.error("카메라 에러:", error); });
+        }
+
+        // 2. 관제 화면용 영상 송출 (트래픽 최적화를 위해 약간 압축)
+        function startCameraStreaming() {
+            setInterval(() => {
+                if (video.readyState === video.HAVE_ENOUGH_DATA && camTopic) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const base64Image = canvas.toDataURL("image/jpeg", 0.4);
+                    camTopic.publish(new ROSLIB.Message({ data: base64Image }));
+                }
+            }, 100);
+        }
+
+        // 💡 3. 스마트폰 자체에서 고화질 원본 기반 AI 분석 루프 가동
+        function loadAIModel() {
+            cocoSsd.load().then(loadedModel => {
+                model = loadedModel;
+                document.getElementById("loading-status").innerText = "✅ 스마트폰 AI 엔진 정상 작동 중";
+                document.getElementById("loading-status").style.color = "#2ecc71";
+                detectFrame(); 
+            }).catch(err => {
+                document.getElementById("loading-status").innerText = "❌ AI 로드 실패 (네트워크 연결 확인)";
+                document.getElementById("loading-status").style.color = "#e74c3c";
+            });
+        }
+
+        // 💡 [화재 감지 알고리즘 추가]: 화면의 주황색/빨간색 불꽃 성분 추출
+        function checkFireDetection(videoElement) {
+            // 임시 캔버스에 현재 비디오 프레임 그리기
+            const fireCanvas = document.getElementById("canvas");
+            const fireCtx = fireCanvas.getContext("2d");
+            fireCtx.drawImage(videoElement, 0, 0, fireCanvas.width, fireCanvas.height);
+            
+            // 화면의 모든 픽셀 데이터 가져오기
+            const imgData = fireCtx.getImageData(0, 0, fireCanvas.width, fireCanvas.height);
+            const data = imgData.data;
+            let firePixelCount = 0;
+
+            // 픽셀 하나하나 검사 (R, G, B, A 순서)
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i];
+                const g = data[i + 1];
+                const b = data[i + 2];
+
+                // 🔥 화재/불꽃의 전형적인 RGB 필터 조건식 (빨강-주황색 계열의 밝은 빛)
+                if (r > 180 && g > 80 && g < 160 && b < 60) {
+                    firePixelCount++;
+                }
+            }
+
+            // 전체 화면 중 불꽃 색상이 0.8% 이상 차지하면 화재로 판단 (시연용 민감도 조절)
+            const totalPixels = fireCanvas.width * fireCanvas.height;
+            const fireRatio = firePixelCount / totalPixels;
+
+            return fireRatio > 0.008; 
+        }
+
+        function detectFrame() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA && model) {
+                // 1. 기존 AI 사람/사물 분석 실행
+                model.detect(video).then(predictions => {
+                    aiCtx.clearRect(0, 0, aiCanvas.width, aiCanvas.height);
+                    
+                    let foundTargets = [];
+
+                    predictions.forEach(prediction => {
+                        const [x, y, width, height] = prediction.bbox;
+                        const label = prediction.class;
+                        const score = Math.round(prediction.score * 100);
+
+                        aiCtx.strokeStyle = label === "person" ? "#e74c3c" : "#f39c12";
+                        aiCtx.lineWidth = 3;
+                        aiCtx.strokeRect(x, y, width, height);
+                        aiCtx.fillStyle = label === "person" ? "#e74c3c" : "#f39c12";
+                        aiCtx.font = "16px Arial";
+                        aiCtx.fillText(`${label} (${score}%)`, x, y > 10 ? y - 5 : 10);
+
+                        if (score > 60) {
+                            foundTargets.push({ label: label, score: score, bbox: prediction.bbox });
+                        }
+                    });
+
+                    // 2. 💡 [화재 감지 조건 연산 동시 실행]
+                    const isFireDetected = checkFireDetection(video);
+
+                    if (isFireDetected) {
+                        // 화재 발생 시 최우선 순위로 노트북에 신호 송신 및 시각화
+                        aiCtx.strokeStyle = "#ff0000";
+                        aiCtx.lineWidth = 8;
+                        aiCtx.strokeRect(5, 5, aiCanvas.width - 10, aiCanvas.height - 10);
+                        aiCtx.fillStyle = "#ff0000";
+                        aiCtx.font = "bold 24px Arial";
+                        aiCtx.fillText("🔥 FIRE DETECTED! 🔥", 20, 40);
+
+                        sendAutoDetection("fire", "🚨 [재난] 구역 내 화재 정황 포착!! 비상 탈출 요망!", foundTargets);
+                        isAlertSent = true;
+                    } else if (foundTargets.length > 0) {
+                        const personTarget = foundTargets.find(t => t.label === "person" && t.score > 65);
+                        sendAutoDetection("intruder", personTarget ? "스마트폰 AI: 침입자 발견!!" : "스마트폰 AI: 사물 감지 중", foundTargets);
+                        isAlertSent = true;
+                    } else {
+                        if (isAlertSent) {
+                            sendAutoDetection("clear", "안정 상태", []);
+                            isAlertSent = false; 
+                        }
+                    }
+
+                    requestAnimationFrame(detectFrame);
+                });
+            } else {
+                setTimeout(detectFrame, 100);
+            }
+        }
+
+        // 💡 기존의 sendAutoDetection 함수를 찾아서 아래 내용으로 교체해 주세요!
+function sendAutoDetection(type, textMsg, allDetections) {
+    if (detTopic) {
+        // 💡 자바스크립트 표준 문법인 JSON.stringify로 오타를 수정합니다.
+        const msgData = JSON.stringify({ 
+            target: type, 
+            text: textMsg, 
+            boxData: allDetections 
+        });
+        detTopic.publish(new ROSLIB.Message({ data: msgData }));
+    }
+}
+    </script>
+</body>
+</html>
